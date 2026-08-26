@@ -32,6 +32,11 @@ def strip_marker(runs, n):
     return out or [["", False]]
 
 
+SPACE_VARIANTS = dict.fromkeys(map(ord, "\u00a0\u2000\u2001\u2002\u2003\u2004\u2005"
+                                          "\u2006\u2007\u2008\u2009\u200a\u202f\u205f"
+                                          "\u3000"), " ")
+
+
 def merge(runs):
     out = []
     for text, bold in runs:
@@ -266,14 +271,32 @@ def from_pdf(path, skip):
                 spans = [s for s in l["spans"] if s["text"].strip()]
                 if not spans:
                     continue
-                text = "".join(s["text"] for s in spans).strip()
                 maxsize = max(round(s["size"], 1) for s in spans)
-                runs = [[s["text"], "Bold" in s["font"]] for s in spans]
+
+                def gap_before(k):
+                    """A style change mid-line often leaves the space between
+                    spans in the geometry rather than in the text."""
+                    if not k:
+                        return False
+                    prev = spans[k - 1]
+                    return (spans[k]["bbox"][0] - prev["bbox"][2] > 0.8
+                            and not prev["text"].endswith((" ", "\u00a0"))
+                            and not spans[k]["text"].startswith((" ", "\u00a0")))
+
+                runs = []
+                for k, s in enumerate(spans):
+                    if gap_before(k):
+                        runs.append([" ", False])
+                    runs.append([s["text"].translate(SPACE_VARIANTS),
+                                 "Bold" in s["font"]])
+                text = "".join(r[0] for r in runs).strip()
                 major = maxsize >= body_size + 1.4
                 kind = (True, 1) if major else (False, 1)
                 segs = []
-                for s in spans:
+                for k, s in enumerate(spans):
                     if segs and s["bbox"][0] - segs[-1]["x1"] < 8:
+                        if gap_before(k):
+                            segs[-1]["runs"].append([" ", False])
                         segs[-1]["runs"].append([s["text"], "Bold" in s["font"]])
                         segs[-1]["x1"] = s["bbox"][2]
                     else:

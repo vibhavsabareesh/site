@@ -75,8 +75,12 @@ class GuideWriter:
     def sanitize(self, text):
         """Replace characters Montserrat has no glyph for, so nothing renders
         as a tofu box (symbol-font bullets, odd dashes and spaces)."""
-        subs = {"\u2013": "-", "\u2014": "\u2014", "\u00a0": " ", "\u2009": " ",
-                "\u200b": "", "\ufeff": "", "\u2028": " "}
+        # every space variant becomes a plain space: Montserrat has no glyph for
+        # the narrow/thin/no-break forms, and dropping them welds words together
+        spaces = "\u00a0\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008" \
+                 "\u2009\u200a\u202f\u205f\u3000\u2028\u2029"
+        subs = {c: " " for c in spaces}
+        subs.update({"\u2013": "-", "\u200b": "", "\ufeff": ""})
         font = self.metrics["mont"]
         out = []
         for ch in text:
