@@ -40,6 +40,29 @@ def merge(runs):
     return [[t, b] for t, b in out if t.strip() or len(out) == 1]
 
 
+def figures(doc, skip, outdir):
+    """Save the source's own images so they can be placed back in the rebuild."""
+    import os
+    out = []
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
+    for pno, pg in enumerate(doc, start=1):
+        if pno in skip:
+            continue
+        for n, inf in enumerate(pg.get_image_info(xrefs=True)):
+            x0, y0, x1, y1 = inf["bbox"]
+            if x1 - x0 < 40 or y1 - y0 < 40:
+                continue                       # rules, bullets, artefacts
+            img = doc.extract_image(inf["xref"])
+            name = f"p{pno}_{n}.{img['ext']}"
+            path = os.path.join(outdir, name)
+            with open(path, "wb") as fh:
+                fh.write(img["image"])
+            out.append({"t": "i", "src": path, "page": pno, "y": y0,
+                        "w": x1 - x0, "h": y1 - y0, "runs": [["", False]]})
+    return out
+
+
 def from_pdf(path, skip):
     import pymupdf
     doc = pymupdf.open(path)
@@ -69,20 +92,53 @@ def from_pdf(path, skip):
                 major = maxsize >= body_size + 1.4
                 kind = (True, 1) if major else (False, 1)
                 lines.append({"text": text, "runs": runs, "kind": kind,
-                              "x0": l["bbox"][0], "x1": l["bbox"][2], "page": pno})
+                              "x0": l["bbox"][0], "x1": l["bbox"][2],
+                              "y": l["bbox"][1], "page": pno})
     if not lines:
         return []
-    right_edge = max(l["x1"] for l in lines if not l["kind"][0]) if any(not l["kind"][0] for l in lines) \
-        else max(l["x1"] for l in lines)
-    full_line = right_edge - 0.06 * (right_edge - min(l["x0"] for l in lines))
+    # Text set in a narrow column (beside a figure, say) has its own right
+    # edge; judging those lines against the page's widest line would end a
+    # paragraph on every line. So each line is measured against the column it
+    # belongs to: the widest line nearby that starts at the same indent.
+    # Normally a paragraph ends when its last line stops short of the page's
+    # right edge. Text wrapped beside a figure has its own, much narrower edge,
+    # so those lines are measured against their column instead.
+    body = [l["x1"] for l in lines if not l["kind"][0]] or [l["x1"] for l in lines]
+    page_right = max(body)
+    figure_bands = {}
+    for pno, pg in enumerate(doc, start=1):
+        if pno in skip:
+            continue
+        bands = []
+        for inf in pg.get_image_info():
+            x0, y0, x1, y1 = inf["bbox"]
+            if x1 - x0 >= 40 and y1 - y0 >= 40:
+                bands.append((y0 - 4, y1 + 4))
+        if bands:
+            figure_bands[pno] = bands
+    for l in lines:
+        band = next((b for b in figure_bands.get(l["page"], [])
+                     if b[0] <= l["y"] <= b[1]), None)
+        if band is None:
+            l["right"] = page_right
+        else:
+            beside = [o["x1"] for o in lines
+                      if o["page"] == l["page"] and band[0] <= o["y"] <= band[1]
+                      and abs(o["x0"] - l["x0"]) <= 8]
+            l["right"] = max(beside or [l["x1"]])
+    page_left = min(l["x0"] for l in lines)
 
-    paras, cur, cur_kind, cur_page = [], [], None, [lines[0]["page"]]
+    paras, cur, cur_kind = [], [], None
+    cur_page, cur_y = [lines[0]["page"]], [lines[0]["y"]]
 
     def flush():
         if not cur:
             return
         runs = merge(cur)
         text = "".join(r[0] for r in runs).strip()
+        if text.isdigit() and len(text) <= 3:
+            cur.clear()                       # a bare page number
+            return
         if text:
             major = cur_kind[0]
             all_bold = all(b for s, b in runs if s.strip())
@@ -92,15 +148,16 @@ def from_pdf(path, skip):
                    and text.rstrip().endswith((":", ".", "-", "?", "!")))
             paras.append({"text": text, "runs": runs,
                           "heading": major or sub, "level": 1 if major else 2,
-                          "page": cur_page[0]})
+                          "page": cur_page[0], "y": cur_y[0]})
         cur.clear()
 
-    span = right_edge - min(l["x0"] for l in lines)
     for i, l in enumerate(lines):
+        span = max(l["right"] - page_left, 1.0)
+        right_edge = l["right"]
         if cur and (l["kind"] != cur_kind or cur_kind[0]):
             flush()
         if not cur:
-            cur_page[0] = l["page"]
+            cur_page[0], cur_y[0] = l["page"], l["y"]
         cur_kind = l["kind"]
         cur.extend(l["runs"])
         cur.append([" ", l["runs"][-1][1]])
@@ -158,6 +215,9 @@ def build_pages(paras, committee, agenda, emblem):
             cur_no = p.get("page")
             cur = {"page": cur_no, "blocks": []}
             pages.append(cur)
+        if p.get("t") == "i":
+            cur["blocks"].append({k: p[k] for k in ("t", "src", "w", "h", "runs")})
+            continue
         if p["heading"]:
             cur["blocks"].append({"t": "h", "text": p["text"],
                                   "level": p.get("level", 1), "runs": p["runs"]})
@@ -174,7 +234,7 @@ def build_pages(paras, committee, agenda, emblem):
         else:
             cur["blocks"].append({"t": "p", "runs": runs})
     pages = [pg for pg in pages if any(
-        any(r[0].strip() for r in b["runs"]) for b in pg["blocks"])]
+        b.get("t") == "i" or any(r[0].strip() for r in b["runs"]) for b in pg["blocks"])]
     out = {"committee": committee, "agenda": agenda, "pages": pages}
     if emblem:
         out["emblem"] = emblem
@@ -217,16 +277,25 @@ if __name__ == "__main__":
     ap.add_argument("--emblem")
     ap.add_argument("--skip", default="", help="1-based source pages to drop, e.g. cover/TOC")
     ap.add_argument("--start", default="", help="drop everything before the paragraph starting with this")
+    ap.add_argument("--figures", default="", help="directory to save the source's images into")
     ap.add_argument("--flow", action="store_true",
                     help="flow continuously instead of mirroring the source pagination")
     a = ap.parse_args()
     skip = {int(x) for x in a.skip.split(",") if x.strip()}
-    paras = (from_docx if a.src.lower().endswith(".docx") else from_pdf)(a.src, skip)
+    is_docx = a.src.lower().endswith(".docx")
+    paras = (from_docx if is_docx else from_pdf)(a.src, skip)
+    figs = []
+    if not is_docx and a.figures:
+        import pymupdf
+        figs = figures(pymupdf.open(a.src), skip, a.figures)
+        print(f"  {len(figs)} figure(s) carried over")
     if a.start:
         for i, p in enumerate(paras):
             if p["text"].lower().startswith(a.start.lower()):
                 paras = paras[i:]
                 break
+    if figs:
+        paras = sorted(paras + figs, key=lambda p: (p.get("page", 0), p.get("y", 0)))
     paged = any("page" in p for p in paras) and not a.flow
     content = (build_pages if paged else build)(paras, a.committee, a.agenda, a.emblem)
     json.dump(content, open(a.out, "w", encoding="utf-8"), indent=1, ensure_ascii=False)

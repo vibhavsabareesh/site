@@ -31,11 +31,12 @@ SUB_SIZE, SUB_LEAD = 13.5, 20.0
 # that width; widening a little keeps a readable size at 1:1 pagination.
 LEFT, RIGHT = 78.0, 517.0
 TOP, BOTTOM = 74.0, 768.0
-PARA_GAP, HEAD_GAP_BEFORE, HEAD_GAP_AFTER = 10.0, 14.0, 8.0
-BULLET_GAP, BULLET_INDENT = 5.0, 12.0
+PARA_GAP, HEAD_GAP_BEFORE, HEAD_GAP_AFTER = 8.0, 12.0, 7.0
+BULLET_GAP, BULLET_INDENT = 2.5, 12.0
 COVER_NAME_SIZE, COVER_NAME_BASELINE = 69.2, 590.5
 COVER_AGENDA_SIZE, COVER_AGENDA_BASELINE, COVER_AGENDA_LEAD = 18.3, 633.1, 25.3
 EMBLEM_BOX = (147.0, 238.0, 456.0, 530.0)
+FIGURE_MAX_HEIGHT = 0.34   # of the text frame
 # Tried in order when a source page holds more than the house frame fits:
 # (type scale, line-height ratio). Line spacing gives before glyph size does,
 # because tighter leading reads far better than shrunken type.
@@ -167,6 +168,9 @@ class GuideWriter:
 
     def render_blocks(self, blocks, fit=(1.0, 1.55), allow_break=True):
         scale, ratio = fit
+        # gaps ride the leading too, so tightening line spacing also tightens
+        # the space between paragraphs and list items
+        g = scale * (ratio / 1.55)
         body_lead = BODY_SIZE * scale * ratio
         head_lead = HEAD_SIZE * scale * (ratio * 0.92)
         sub_lead = SUB_SIZE * scale * (ratio * 0.96)
@@ -176,28 +180,64 @@ class GuideWriter:
                 runs = [[runs, False]]
             runs = [(r[0], bool(r[1])) for r in runs]
             kind = blk.get("t", "p")
+            if kind == "i":
+                self.place_image(blk, scale, allow_break)
+                continue
             if kind == "h":
                 level = blk.get("level", 1)
                 if level == 1:
-                    self.gap(HEAD_GAP_BEFORE * scale)
+                    self.gap(HEAD_GAP_BEFORE * g)
                     self.write_runs([(blk["text"], True)], HEAD_SIZE * scale,
                                     head_lead, center=True, allow_break=allow_break)
-                    self.gap(HEAD_GAP_AFTER * scale)
+                    self.gap(HEAD_GAP_AFTER * g)
                 else:
-                    self.gap(8 * scale)
+                    self.gap(8 * g)
                     self.write_runs([(blk["text"], True)], SUB_SIZE * scale,
                                     sub_lead, allow_break=allow_break)
-                    self.gap(4 * scale)
+                    self.gap(4 * g)
             elif kind == "b":
                 marker = blk.get("marker", "•")
                 self.write_runs([(marker + " ", False)] + runs, BODY_SIZE * scale,
                                 body_lead, indent=BULLET_INDENT,
                                 allow_break=allow_break)
-                self.gap(BULLET_GAP * scale)
+                self.gap(BULLET_GAP * g)
             else:
                 self.write_runs(runs, BODY_SIZE * scale, body_lead,
                                 allow_break=allow_break)
-                self.gap(PARA_GAP * scale)
+                self.gap(PARA_GAP * g)
+
+    def place_image(self, blk, scale, allow_break=True):
+        """Draw one of the source's figures, scaled to the frame."""
+        src = blk["src"]
+        if not os.path.isabs(src):
+            src = os.path.join(HERE, src)
+        w, h = blk.get("w") or 0, blk.get("h") or 0
+        if not (w and h) and os.path.exists(src):
+            pix = pymupdf.Pixmap(src)
+            w, h = pix.width, pix.height
+        w, h = w * scale, h * scale
+        avail = RIGHT - LEFT
+        # a figure never takes more than a third of the frame, so an
+        # illustrated page does not drag the whole guide's type size down
+        cap = FIGURE_MAX_HEIGHT * (BOTTOM - TOP) * scale
+        if h > cap:
+            w *= cap / h
+            h = cap
+        if w > avail:
+            h *= avail / w
+            w = avail
+        room = BOTTOM - self.y
+        if h > room and room > 0:
+            # a figure that would run past the frame is scaled to what is left
+            w *= room / h
+            h = room
+        self.gap(6 * scale)
+        if not self.dry and os.path.exists(src):
+            x = LEFT + (avail - w) / 2
+            self.page.insert_image(pymupdf.Rect(x, self.y, x + w, self.y + h),
+                                   filename=src, keep_proportion=True, overlay=True)
+        self.y += h
+        self.gap(8 * scale)
 
     def height_of(self, blocks, fit):
         """Dry-run the blocks to see how tall they are at this setting."""
@@ -247,7 +287,8 @@ class GuideWriter:
         if pages:
             live = []
             for src in pages:
-                blocks = [b for b in src["blocks"] if any(r[0].strip() for r in b["runs"])]
+                blocks = [b for b in src["blocks"]
+                          if b.get("t") == "i" or any(r[0].strip() for r in b["runs"])]
                 if blocks:
                     live.append(blocks)           # never emit a blank page
             usable = BOTTOM - TOP
