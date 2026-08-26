@@ -36,7 +36,7 @@ BULLET_GAP, BULLET_INDENT = 2.5, 12.0
 COVER_NAME_SIZE, COVER_NAME_BASELINE = 69.2, 590.5
 COVER_AGENDA_SIZE, COVER_AGENDA_BASELINE, COVER_AGENDA_LEAD = 18.3, 633.1, 25.3
 EMBLEM_BOX = (147.0, 238.0, 456.0, 530.0)
-FIGURE_MAX_HEIGHT = 0.34   # of the text frame
+FIGURE_MIN_SHARE = 0.45    # a figure never shrinks below this much of its size
 # Tried in order when a source page holds more than the house frame fits:
 # (type scale, line-height ratio). Line spacing gives before glyph size does,
 # because tighter leading reads far better than shrunken type.
@@ -166,7 +166,7 @@ class GuideWriter:
 
     # ---------- blocks ----------
 
-    def render_blocks(self, blocks, fit=(1.0, 1.55), allow_break=True):
+    def render_blocks(self, blocks, fit=(1.0, 1.55), allow_break=True, fig_scale=1.0):
         scale, ratio = fit
         # gaps ride the leading too, so tightening line spacing also tightens
         # the space between paragraphs and list items
@@ -181,7 +181,7 @@ class GuideWriter:
             runs = [(r[0], bool(r[1])) for r in runs]
             kind = blk.get("t", "p")
             if kind == "i":
-                self.place_image(blk, scale, allow_break)
+                self.place_image(blk, scale * fig_scale, allow_break)
                 continue
             if kind == "h":
                 level = blk.get("level", 1)
@@ -217,12 +217,6 @@ class GuideWriter:
             w, h = pix.width, pix.height
         w, h = w * scale, h * scale
         avail = RIGHT - LEFT
-        # a figure never takes more than a third of the frame, so an
-        # illustrated page does not drag the whole guide's type size down
-        cap = FIGURE_MAX_HEIGHT * (BOTTOM - TOP) * scale
-        if h > cap:
-            w *= cap / h
-            h = cap
         if w > avail:
             h *= avail / w
             w = avail
@@ -239,14 +233,27 @@ class GuideWriter:
         self.y += h
         self.gap(8 * scale)
 
-    def height_of(self, blocks, fit):
+    def height_of(self, blocks, fit, fig_scale=1.0):
         """Dry-run the blocks to see how tall they are at this setting."""
         self.dry, saved_y = True, self.y
         self.y = TOP
-        self.render_blocks(blocks, fit, allow_break=False)
+        self.render_blocks(blocks, fit, allow_break=False, fig_scale=fig_scale)
         h = self.y - TOP
         self.dry, self.y = False, saved_y
         return h
+
+    def figure_fit(self, blocks, fit, usable):
+        """How much of their natural size the figures on this page can keep:
+        whatever the text leaves, never more than full size."""
+        if not any(b.get("t") == "i" for b in blocks):
+            return 1.0
+        text_only = [b for b in blocks if b.get("t") != "i"]
+        text_h = self.height_of(text_only, fit)
+        full_h = self.height_of(blocks, fit) - text_h
+        if full_h <= 0:
+            return 1.0
+        room = usable - text_h
+        return max(FIGURE_MIN_SHARE, min(1.0, room / full_h))
 
     # ---------- cover ----------
 
@@ -343,12 +350,15 @@ class GuideWriter:
             usable = BOTTOM - TOP
             # one scale for the whole guide: per-page scaling would make the
             # type size jump around between pages
-            fit = next((f for f in FIT_STEPS
-                        if all(self.height_of(b, f) <= usable for b in live)),
+            def page_fits(blocks, f):
+                return self.height_of(blocks, f, self.figure_fit(blocks, f, usable)) <= usable
+
+            fit = next((f for f in FIT_STEPS if all(page_fits(b, f) for b in live)),
                        FIT_STEPS[-1])
             for blocks in live:
                 self.new_page()
-                self.render_blocks(blocks, fit, allow_break=False)
+                self.render_blocks(blocks, fit, allow_break=False,
+                                   fig_scale=self.figure_fit(blocks, fit, usable))
             print(f"  {len(live)} content pages at {BODY_SIZE * fit[0]:.1f}pt "
                   f"/ {BODY_SIZE * fit[0] * fit[1]:.1f}pt leading")
         else:
