@@ -36,6 +36,7 @@ BULLET_GAP, BULLET_INDENT = 2.5, 12.0
 COVER_NAME_SIZE, COVER_NAME_BASELINE = 69.2, 590.5
 COVER_AGENDA_SIZE, COVER_AGENDA_BASELINE, COVER_AGENDA_LEAD = 18.3, 633.1, 25.3
 EMBLEM_BOX = (147.0, 238.0, 456.0, 530.0)
+LAYOUT_LEFT, LAYOUT_RIGHT = 26.0, 570.0
 FIGURE_MIN_SHARE = 0.45    # a figure never shrinks below this much of its size
 # Tried in order when a source page holds more than the house frame fits:
 # (type scale, line-height ratio). Line spacing gives before glyph size does,
@@ -343,9 +344,12 @@ class GuideWriter:
                 boxes.append([it["x"], it["y"] - it["size"], it["x"] + it["w"], it["y"]])
         x0 = min(b[0] for b in boxes); y0 = min(b[1] for b in boxes)
         x1 = max(b[2] for b in boxes); y1 = max(b[3] for b in boxes)
-        fw, fh = RIGHT - LEFT, BOTTOM - TOP
+        # layout pages use the full page width, not the text frame, so a photo
+        # grid comes out at the size it was designed at
+        left, right = LAYOUT_LEFT, LAYOUT_RIGHT
+        fw, fh = right - left, BOTTOM - TOP
         s = min(fw / max(x1 - x0, 1), fh / max(y1 - y0, 1))
-        ox = LEFT + (fw - (x1 - x0) * s) / 2 - x0 * s
+        ox = left + (fw - (x1 - x0) * s) / 2 - x0 * s
         oy = TOP + (fh - (y1 - y0) * s) / 2 - y0 * s
         pg = self.new_page()
         for it in items:
@@ -353,9 +357,11 @@ class GuideWriter:
                 r = it["rect"]
                 src = it["src"] if os.path.isabs(it["src"]) else os.path.join(HERE, it["src"])
                 if os.path.exists(src):
+                    # fill the mapped rect exactly as the source did: no
+                    # refitting, so the pictures are untouched
                     pg.insert_image(pymupdf.Rect(ox + r[0] * s, oy + r[1] * s,
                                                  ox + r[2] * s, oy + r[3] * s),
-                                    filename=src, keep_proportion=True, overlay=True)
+                                    filename=src, keep_proportion=False, overlay=True)
         for it in items:
             if it["k"] != "txt":
                 continue
@@ -368,11 +374,21 @@ class GuideWriter:
             # Montserrat is wider than the serif faces these guides use, so a
             # span is eased down until it sits inside its original footprint
             if room > 0:
-                while size > 4 and self.measure(text, font, size) > room * 1.06:
-                    size -= 0.25
-            pg.insert_text((ox + it["x"] * s, oy + it["y"] * s), text, fontname=font,
-                           fontfile=BOLD_TTF if it.get("bold") else REG_TTF,
-                           fontsize=size, color=WHITE)
+                # no slack: any overflow here runs off the page edge
+                while size > 3.5 and self.measure(text, font, size) > room:
+                    size -= 0.2
+            # place word by word rather than drawing the whole string: some
+            # viewers collapse the spaces in an embedded-subset font
+            x = ox + it["x"] * s
+            y = oy + it["y"] * s
+            space = self.measure(" ", font, size)
+            for wi, word in enumerate(text.split()):
+                if wi:
+                    x += space
+                pg.insert_text((x, y), word, fontname=font,
+                               fontfile=BOLD_TTF if it.get("bold") else REG_TTF,
+                               fontsize=size, color=WHITE)
+                x += self.measure(word, font, size)
 
     # ---------- build ----------
 

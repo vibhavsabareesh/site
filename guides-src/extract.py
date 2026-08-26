@@ -185,6 +185,12 @@ def layout(doc, skip, outdir):
     """
     import os
     os.makedirs(outdir, exist_ok=True)
+    # an image repeated on most pages is a watermark, not content
+    seen = collections.Counter()
+    for pg in doc:
+        for inf in pg.get_image_info():
+            seen[(inf["width"], inf["height"])] += 1
+    watermarks = {k for k, n in seen.items() if n >= max(5, doc.page_count // 2)}
     pages = []
     for pno, pg in enumerate(doc, start=1):
         if pno in skip:
@@ -193,6 +199,8 @@ def layout(doc, skip, outdir):
         for n, inf in enumerate(pg.get_image_info(xrefs=True)):
             x0, y0, x1, y1 = inf["bbox"]
             if x1 - x0 < 24 or y1 - y0 < 24:
+                continue
+            if (inf["width"], inf["height"]) in watermarks:
                 continue
             img = doc.extract_image(inf["xref"])
             name = f"p{pno}_{n}.{img['ext']}"
