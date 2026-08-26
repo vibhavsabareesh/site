@@ -427,10 +427,18 @@ class GuideWriter:
 
             fit = next((f for f in FIT_STEPS if all(page_fits(b, f) for b in live)),
                        FIT_STEPS[-1])
+            spilled = 0
             for blocks in live:
                 self.new_page()
-                self.render_blocks(blocks, fit, allow_break=False,
-                                   fig_scale=self.figure_fit(blocks, fit, usable))
+                fs = self.figure_fit(blocks, fit, usable)
+                # a page too full even at the smallest setting must be allowed
+                # to run on: silently writing past the frame would lose text
+                overflows = self.height_of(blocks, fit, fs) > usable
+                if overflows:
+                    spilled += 1
+                self.render_blocks(blocks, fit, allow_break=overflows, fig_scale=fs)
+            if spilled:
+                print(f"  {spilled} page(s) ran on rather than lose text")
             print(f"  {len(live)} content pages at {BODY_SIZE * fit[0]:.1f}pt "
                   f"/ {BODY_SIZE * fit[0] * fit[1]:.1f}pt leading")
         else:

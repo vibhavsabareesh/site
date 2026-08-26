@@ -202,6 +202,35 @@ def detect_tables(lines, min_rows=3, gap=18.0):
             ri = rj
         else:
             ri += 1
+    # Second pass: two or more consecutive rows that each hold several lines on
+    # one baseline are columnar by construction -- body text never puts two
+    # lines on the same baseline. This catches short blocks the anchor pass
+    # skips, such as a two-name signature block.
+    ri = 0
+    while ri < len(rows):
+        if len(rows[ri]) < 2 or any(i in used for i in rows[ri]):
+            ri += 1
+            continue
+        width = len(rows[ri])
+        page = lines[rows[ri][0]]["page"]
+        rj = ri
+        while (rj < len(rows) and len(rows[rj]) == width
+               and lines[rows[rj][0]]["page"] == page
+               and not any(i in used for i in rows[rj])
+               and not any(lines[i]["kind"][0] for i in rows[rj])):
+            rj += 1
+        if rj - ri >= 2:
+            cols = [lines[i]["x0"] for i in rows[ri]]
+            out = []
+            for r in rows[ri:rj]:
+                out.append({cols[k]: [i] for k, i in enumerate(r)})
+            first = min(rows[ri])
+            tables[first] = {"anchors": cols, "rows": out}
+            for r in rows[ri:rj]:
+                used.update(r)
+            ri = rj
+        else:
+            ri += 1
     return tables, used
 
 
@@ -388,6 +417,10 @@ def from_pdf(path, skip):
 
     tables, table_lines = detect_tables(lines)
 
+    steps = [b["y"] - a["y"] for a, b in zip(lines, lines[1:])
+             if a["page"] == b["page"] and 0 < b["y"] - a["y"] < 60]
+    line_h = sorted(steps)[len(steps) // 2] if steps else 16.0
+
     for i, l in enumerate(lines):
         if i in tables:
             flush()
@@ -424,9 +457,14 @@ def from_pdf(path, skip):
             continue
         if i in table_lines:
             continue
+        prev = lines[i - 1] if i else None
+        heading_continues = bool(
+            prev and l["kind"][0] and prev["kind"] == l["kind"]
+            and prev["page"] == l["page"]
+            and 0 < l["y"] - prev["y"] <= line_h * 1.7)
         span = max(l["right"] - page_left, 1.0)
         right_edge = l["right"]
-        if cur and (l["kind"] != cur_kind or cur_kind[0]):
+        if cur and (l["kind"] != cur_kind or (cur_kind[0] and not heading_continues)):
             flush()
         if not cur:
             cur_page[0], cur_y[0] = l["page"], l["y"]
