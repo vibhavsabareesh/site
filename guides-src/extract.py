@@ -167,6 +167,29 @@ def detect_tables(lines, min_rows=3, gap=18.0):
             for i, c in zip(rows[rj], cj):
                 out[-1].setdefault(c if c is not None else cand[-1], []).append(i)
             rj += 1
+        # a wrapped first-column cell ("8-9 Aug" / "1953") starts what looks
+        # like a row of its own; fold it into the row that carries the content
+        folded = []
+        for row in out:
+            others = [c for c in row if c != min(row)]
+            empty_rest = not any(row.get(c) for c in others)
+            if folded and empty_rest and row.get(min(row)):
+                pending = row
+                folded.append(pending)
+                continue
+            folded.append(row)
+        merged = []
+        for row in folded:
+            first_col = min(row) if row else None
+            others = [c for c in row if c != first_col]
+            if merged and not any(merged[-1].get(c) for c in others) \
+                    and merged[-1].get(first_col) and any(row.get(c) for c in others):
+                row[first_col] = merged[-1].get(first_col, []) + row.get(first_col, [])
+                merged[-1] = row
+            else:
+                merged.append(row)
+        out = merged
+
         if len(out) >= min_rows:
             first = min(rows[ri])
             # the header row often spans fewer columns than the body, so the
