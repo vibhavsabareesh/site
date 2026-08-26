@@ -275,6 +275,47 @@ class GuideWriter:
                            fontfile=BOLD_TTF, fontsize=COVER_AGENDA_SIZE, color=WHITE)
             y += COVER_AGENDA_LEAD
 
+    def layout_page(self, items):
+        """Reproduce a source page's geometry inside the house frame."""
+        boxes = []
+        for it in items:
+            if it["k"] == "img":
+                boxes.append(it["rect"])
+            else:
+                boxes.append([it["x"], it["y"] - it["size"], it["x"] + it["w"], it["y"]])
+        x0 = min(b[0] for b in boxes); y0 = min(b[1] for b in boxes)
+        x1 = max(b[2] for b in boxes); y1 = max(b[3] for b in boxes)
+        fw, fh = RIGHT - LEFT, BOTTOM - TOP
+        s = min(fw / max(x1 - x0, 1), fh / max(y1 - y0, 1))
+        ox = LEFT + (fw - (x1 - x0) * s) / 2 - x0 * s
+        oy = TOP + (fh - (y1 - y0) * s) / 2 - y0 * s
+        pg = self.new_page()
+        for it in items:
+            if it["k"] == "img":
+                r = it["rect"]
+                src = it["src"] if os.path.isabs(it["src"]) else os.path.join(HERE, it["src"])
+                if os.path.exists(src):
+                    pg.insert_image(pymupdf.Rect(ox + r[0] * s, oy + r[1] * s,
+                                                 ox + r[2] * s, oy + r[3] * s),
+                                    filename=src, keep_proportion=True, overlay=True)
+        for it in items:
+            if it["k"] != "txt":
+                continue
+            text = self.sanitize(it["text"]).strip()
+            if not text:
+                continue
+            font = "montb" if it.get("bold") else "mont"
+            size = it["size"] * s
+            room = it["w"] * s
+            # Montserrat is wider than the serif faces these guides use, so a
+            # span is eased down until it sits inside its original footprint
+            if room > 0:
+                while size > 4 and self.measure(text, font, size) > room * 1.06:
+                    size -= 0.25
+            pg.insert_text((ox + it["x"] * s, oy + it["y"] * s), text, fontname=font,
+                           fontfile=BOLD_TTF if it.get("bold") else REG_TTF,
+                           fontsize=size, color=WHITE)
+
     # ---------- build ----------
 
     def build(self, content, out):
@@ -282,6 +323,14 @@ class GuideWriter:
         if emblem and not os.path.isabs(emblem):
             emblem = os.path.join(HERE, emblem)
         self.cover(content["committee"], content["agenda"], emblem)
+
+        laid = content.get("layout_pages")
+        if laid:
+            for pg in laid:
+                self.layout_page(pg["items"])
+            print(f"  {len(laid)} pages reproduced by layout")
+            self.doc.save(out, garbage=4, deflate=True)
+            return self.doc.page_count
 
         pages = content.get("pages")
         if pages:

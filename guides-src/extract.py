@@ -40,6 +40,93 @@ def merge(runs):
     return [[t, b] for t, b in out if t.strip() or len(out) == 1]
 
 
+def downsample(path, placed_w_pt, dpi=200, quality=82):
+    """Shrink an image to the resolution it is actually shown at.
+
+    Photo-led guides embed originals many times larger than their placed size;
+    left alone the rebuilt PDF runs to tens of megabytes.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return path
+    try:
+        im = Image.open(path)
+    except Exception:
+        return path
+    target = max(int(placed_w_pt * dpi / 72), 32)
+    if im.width > target:
+        im = im.resize((target, max(1, round(im.height * target / im.width))), Image.LANCZOS)
+    has_alpha = im.mode in ("RGBA", "LA") or "transparency" in im.info
+    if has_alpha:
+        im.save(path)
+        return path
+    jpg = os.path.splitext(path)[0] + ".jpg"
+    im.convert("RGB").save(jpg, quality=quality, optimize=True)
+    if jpg != path and os.path.exists(path):
+        os.remove(path)
+    return jpg
+
+
+def save_image(doc, xref, path):
+    """Write an image out, composing its soft mask so transparency survives.
+
+    Without this a masked image (a watermark, say) is drawn as an opaque
+    rectangle over the page.
+    """
+    import pymupdf
+    info = doc.extract_image(xref)
+    if info.get("smask"):
+        pix = pymupdf.Pixmap(info["image"])
+        mask = pymupdf.Pixmap(doc.extract_image(info["smask"])["image"])
+        try:
+            pix = pymupdf.Pixmap(pix, mask)
+        except Exception:
+            pass
+        path = os.path.splitext(path)[0] + ".png"
+        pix.save(path)
+        return path
+    with open(path, "wb") as fh:
+        fh.write(info["image"])
+    return path
+
+
+def layout(doc, skip, outdir):
+    """Capture a page as geometry: every image and text span with its position.
+
+    Used for guides whose layout *is* the content -- photo grids and the like --
+    where reflowing the text would destroy the page.
+    """
+    import os
+    os.makedirs(outdir, exist_ok=True)
+    pages = []
+    for pno, pg in enumerate(doc, start=1):
+        if pno in skip:
+            continue
+        items = []
+        for n, inf in enumerate(pg.get_image_info(xrefs=True)):
+            x0, y0, x1, y1 = inf["bbox"]
+            if x1 - x0 < 24 or y1 - y0 < 24:
+                continue
+            img = doc.extract_image(inf["xref"])
+            name = f"p{pno}_{n}.{img['ext']}"
+            saved = save_image(doc, inf["xref"], os.path.join(outdir, name))
+            saved = downsample(saved, x1 - x0)
+            items.append({"k": "img", "src": saved, "rect": [x0, y0, x1, y1]})
+        for b in pg.get_text("dict")["blocks"]:
+            for l in b.get("lines", []):
+                for s in l["spans"]:
+                    if not s["text"].strip():
+                        continue
+                    items.append({"k": "txt", "text": s["text"],
+                                  "x": s["origin"][0], "y": s["origin"][1],
+                                  "size": s["size"], "bold": "Bold" in s["font"],
+                                  "w": s["bbox"][2] - s["bbox"][0]})
+        if items:
+            pages.append({"page": pno, "items": items})
+    return pages
+
+
 def figures(doc, skip, outdir):
     """Save the source's own images so they can be placed back in the rebuild."""
     import os
@@ -55,9 +142,8 @@ def figures(doc, skip, outdir):
                 continue                       # rules, bullets, artefacts
             img = doc.extract_image(inf["xref"])
             name = f"p{pno}_{n}.{img['ext']}"
-            path = os.path.join(outdir, name)
-            with open(path, "wb") as fh:
-                fh.write(img["image"])
+            path = downsample(save_image(doc, inf["xref"], os.path.join(outdir, name)),
+                              x1 - x0)
             out.append({"t": "i", "src": path, "page": pno, "y": y0,
                         "w": x1 - x0, "h": y1 - y0, "runs": [["", False]]})
     return out
@@ -144,8 +230,9 @@ def from_pdf(path, skip):
             all_bold = all(b for s, b in runs if s.strip())
             # a whole short paragraph in bold is a subheading; bold inside a
             # longer paragraph is just emphasis
-            sub = (not major and all_bold and len(text) < 70
-                   and text.rstrip().endswith((":", ".", "-", "?", "!")))
+            # a whole short paragraph set in bold is a subheading; guides
+            # often set these only a point larger than the body
+            sub = not major and all_bold and len(text) < 70 and len(text.split()) <= 10
             paras.append({"text": text, "runs": runs,
                           "heading": major or sub, "level": 1 if major else 2,
                           "page": cur_page[0], "y": cur_y[0]})
@@ -179,9 +266,42 @@ def from_pdf(path, skip):
     return paras
 
 
-def from_docx(path, skip):
+DOCX_NS = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+           "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+           "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"}
+EMU_PER_PT = 12700
+
+
+def docx_images(para, doc, outdir, counter):
+    """Inline images in this paragraph, saved and sized in points."""
+    import os
+    out = []
+    for blip in para._p.findall(".//{%s}blip" % DOCX_NS["a"]):
+        rid = blip.get("{%s}embed" % DOCX_NS["r"])
+        if not rid or rid not in doc.part.related_parts:
+            continue
+        part = doc.part.related_parts[rid]
+        ext = os.path.splitext(part.partname)[1] or ".png"
+        counter[0] += 1
+        name = f"docx_{counter[0]}{ext}"
+        os.makedirs(outdir, exist_ok=True)
+        path = os.path.join(outdir, name)
+        with open(path, "wb") as fh:
+            fh.write(part.blob)
+        holder = blip.getparent().getparent().getparent()
+        ext_el = holder.find(".//{%s}extent" % DOCX_NS["wp"]) if holder is not None else None
+        w = h = 0
+        if ext_el is not None:
+            w = int(ext_el.get("cx", 0)) / EMU_PER_PT
+            h = int(ext_el.get("cy", 0)) / EMU_PER_PT
+        out.append({"t": "i", "src": path, "w": w, "h": h, "runs": [["", False]]})
+    return out
+
+
+def from_docx(path, skip, figdir=""):
     import docx
     d = docx.Document(path)
+    counter = [0]
     sizes = collections.Counter()
     for p in d.paragraphs:
         for r in p.runs:
@@ -190,6 +310,9 @@ def from_docx(path, skip):
     body_size = sizes.most_common(1)[0][0] if sizes else 11.0
     paras = []
     for p in d.paragraphs:
+        if figdir:
+            for img in docx_images(p, d, figdir, counter):
+                paras.append(img)
         text = p.text.strip()
         if not text:
             continue
@@ -243,22 +366,31 @@ def build_pages(paras, committee, agenda, emblem):
 
 def build(paras, committee, agenda, emblem):
     sections, cur = [], None
-    for p in paras:
-        if p["heading"]:
-            cur = {"heading": p["text"], "level": p.get("level", 1),
-                   "page_break": p.get("level", 1) == 1, "blocks": []}
-            sections.append(cur)
-            continue
+
+    def ensure():
+        nonlocal cur
         if cur is None:
             cur = {"heading": "", "level": 1, "page_break": False, "blocks": []}
             sections.append(cur)
+        return cur
+
+    for p in paras:
+        if p.get("t") == "i":
+            ensure()["blocks"].append({k: p[k] for k in ("t", "src", "w", "h", "runs")})
+            continue
+        if p["heading"]:
+            cur = {"heading": p["text"], "level": p.get("level", 1),
+                   "page_break": False, "blocks": []}
+            sections.append(cur)
+            continue
+        ensure()
         runs = p["runs"]
         m = BULLET.match(p["text"])
         if m:
             marker = m.group(0).strip()
-            runs = [[BULLET.sub("", runs[0][0], count=1), runs[0][1]]] + runs[1:]
+            runs = strip_marker(runs, len(m.group(0)))
             blk = {"t": "b", "runs": runs}
-            if marker[0].isdigit():
+            if marker and marker[0].isdigit():
                 blk["marker"] = marker      # numbered lists keep their numbers
             cur["blocks"].append(blk)
         else:
@@ -278,12 +410,29 @@ if __name__ == "__main__":
     ap.add_argument("--skip", default="", help="1-based source pages to drop, e.g. cover/TOC")
     ap.add_argument("--start", default="", help="drop everything before the paragraph starting with this")
     ap.add_argument("--figures", default="", help="directory to save the source's images into")
+    ap.add_argument("--layout", action="store_true",
+                    help="reproduce the source page geometry (photo grids etc.) "
+                         "instead of reflowing the text")
     ap.add_argument("--flow", action="store_true",
                     help="flow continuously instead of mirroring the source pagination")
     a = ap.parse_args()
     skip = {int(x) for x in a.skip.split(",") if x.strip()}
+    if a.layout:
+        import pymupdf
+        doc = pymupdf.open(a.src)
+        content = {"committee": a.committee, "agenda": a.agenda,
+                   "layout_pages": layout(doc, skip, a.figures or "figures")}
+        if a.emblem:
+            content["emblem"] = a.emblem
+        json.dump(content, open(a.out, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+        items = [i for pg in content["layout_pages"] for i in pg["items"]]
+        print(f"{a.out}: {len(content['layout_pages'])} pages laid out, "
+              f"{sum(1 for i in items if i['k'] == 'img')} images, "
+              f"{sum(1 for i in items if i['k'] == 'txt')} text spans")
+        raise SystemExit
+
     is_docx = a.src.lower().endswith(".docx")
-    paras = (from_docx if is_docx else from_pdf)(a.src, skip)
+    paras = from_docx(a.src, skip, a.figures) if is_docx else from_pdf(a.src, skip)
     figs = []
     if not is_docx and a.figures:
         import pymupdf
