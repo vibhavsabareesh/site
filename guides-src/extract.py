@@ -9,7 +9,25 @@ Usage:  python extract.py in.pdf|in.docx out.json --committee UNSC --agenda "...
 """
 import argparse, collections, json, os, re, sys
 
-BULLET = re.compile(r"^\s*(?:[•●▪\-–]|\d+[.)])\s+")
+# Word and Google Docs export bullets as private-use glyphs from symbol fonts
+# (\uf0b7 and friends); those have no Montserrat glyph and would render as tofu.
+BULLET_CHARS = "•●▪‣◦○➢➤·∙"
+PUA_BULLETS = "\uf0a7\uf0b7\uf0d8\uf06c\uf0fc\uf0a8\uf076"
+BULLET = re.compile(r"^\s*(?:[" + BULLET_CHARS + PUA_BULLETS + r"\-\u2013]|\d+[.)])\s*")
+
+
+def strip_marker(runs, n):
+    """Drop the first n characters of a paragraph, spanning runs if needed."""
+    out, left = [], n
+    for text, bold in runs:
+        if left <= 0:
+            out.append([text, bold])
+        elif len(text) <= left:
+            left -= len(text)
+        else:
+            out.append([text[left:], bold])
+            left = 0
+    return out or [["", False]]
 
 
 def merge(runs):
@@ -58,7 +76,7 @@ def from_pdf(path, skip):
         else max(l["x1"] for l in lines)
     full_line = right_edge - 0.06 * (right_edge - min(l["x0"] for l in lines))
 
-    paras, cur, cur_kind = [], [], None
+    paras, cur, cur_kind, cur_page = [], [], None, [lines[0]["page"]]
 
     def flush():
         if not cur:
@@ -73,13 +91,16 @@ def from_pdf(path, skip):
             sub = (not major and all_bold and len(text) < 70
                    and text.rstrip().endswith((":", ".", "-", "?", "!")))
             paras.append({"text": text, "runs": runs,
-                          "heading": major or sub, "level": 1 if major else 2})
+                          "heading": major or sub, "level": 1 if major else 2,
+                          "page": cur_page[0]})
         cur.clear()
 
     span = right_edge - min(l["x0"] for l in lines)
     for i, l in enumerate(lines):
         if cur and (l["kind"] != cur_kind or cur_kind[0]):
             flush()
+        if not cur:
+            cur_page[0] = l["page"]
         cur_kind = l["kind"]
         cur.extend(l["runs"])
         cur.append([" ", l["runs"][-1][1]])
@@ -129,6 +150,37 @@ def from_docx(path, skip):
     return paras
 
 
+def build_pages(paras, committee, agenda, emblem):
+    """One entry per source page, so the output can be a 1:1 replica."""
+    pages, cur_no, cur = [], None, None
+    for p in paras:
+        if p.get("page") != cur_no:
+            cur_no = p.get("page")
+            cur = {"page": cur_no, "blocks": []}
+            pages.append(cur)
+        if p["heading"]:
+            cur["blocks"].append({"t": "h", "text": p["text"],
+                                  "level": p.get("level", 1), "runs": p["runs"]})
+            continue
+        runs = p["runs"]
+        m = BULLET.match(p["text"])
+        if m:
+            marker = m.group(0).strip()
+            runs = strip_marker(runs, len(m.group(0)))
+            blk = {"t": "b", "runs": runs}
+            if marker and marker[0].isdigit():
+                blk["marker"] = marker
+            cur["blocks"].append(blk)
+        else:
+            cur["blocks"].append({"t": "p", "runs": runs})
+    pages = [pg for pg in pages if any(
+        any(r[0].strip() for r in b["runs"]) for b in pg["blocks"])]
+    out = {"committee": committee, "agenda": agenda, "pages": pages}
+    if emblem:
+        out["emblem"] = emblem
+    return out
+
+
 def build(paras, committee, agenda, emblem):
     sections, cur = [], None
     for p in paras:
@@ -165,6 +217,8 @@ if __name__ == "__main__":
     ap.add_argument("--emblem")
     ap.add_argument("--skip", default="", help="1-based source pages to drop, e.g. cover/TOC")
     ap.add_argument("--start", default="", help="drop everything before the paragraph starting with this")
+    ap.add_argument("--flow", action="store_true",
+                    help="flow continuously instead of mirroring the source pagination")
     a = ap.parse_args()
     skip = {int(x) for x in a.skip.split(",") if x.strip()}
     paras = (from_docx if a.src.lower().endswith(".docx") else from_pdf)(a.src, skip)
@@ -173,10 +227,17 @@ if __name__ == "__main__":
             if p["text"].lower().startswith(a.start.lower()):
                 paras = paras[i:]
                 break
-    content = build(paras, a.committee, a.agenda, a.emblem)
+    paged = any("page" in p for p in paras) and not a.flow
+    content = (build_pages if paged else build)(paras, a.committee, a.agenda, a.emblem)
     json.dump(content, open(a.out, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
-    heads = sum(1 for s in content["sections"] if s["heading"])
-    blocks = [b for s in content["sections"] for b in s["blocks"]]
-    print(f"{a.out}: {len(content['sections'])} sections ({heads} headed), "
-          f"{sum(1 for b in blocks if b['t'] == 'p')} paragraphs, "
-          f"{sum(1 for b in blocks if b['t'] == 'b')} bullets")
+    if "pages" in content:
+        blocks = [b for pg in content["pages"] for b in pg["blocks"]]
+        print(f"{a.out}: {len(content['pages'])} source pages, "
+              f"{sum(1 for b in blocks if b['t'] == 'h')} headings, "
+              f"{sum(1 for b in blocks if b['t'] == 'p')} paragraphs, "
+              f"{sum(1 for b in blocks if b['t'] == 'b')} bullets")
+    else:
+        blocks = [b for s in content["sections"] for b in s["blocks"]]
+        print(f"{a.out}: {len(content['sections'])} sections, "
+              f"{sum(1 for b in blocks if b['t'] == 'p')} paragraphs, "
+              f"{sum(1 for b in blocks if b['t'] == 'b')} bullets")
