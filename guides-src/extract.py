@@ -13,7 +13,9 @@ import argparse, collections, json, os, re, sys
 # (\uf0b7 and friends); those have no Montserrat glyph and would render as tofu.
 BULLET_CHARS = "•●▪‣◦○➢➤·∙"
 PUA_BULLETS = "\uf0a7\uf0b7\uf0d8\uf06c\uf0fc\uf0a8\uf076"
-BULLET = re.compile(r"^\s*(?:[" + BULLET_CHARS + PUA_BULLETS + r"\-\u2013]|\d+[.)])\s*")
+# a numeric marker is at most two digits: "12." is a list item, "5334." is
+# a bill number that happens to start a line
+BULLET = re.compile(r"^\s*(?:[" + BULLET_CHARS + PUA_BULLETS + r"\-\u2013]|\d{1,2}[.)])\s*")
 
 
 def strip_marker(runs, n):
