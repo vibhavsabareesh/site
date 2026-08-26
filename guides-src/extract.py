@@ -561,6 +561,9 @@ if __name__ == "__main__":
     ap.add_argument("--layout", action="store_true",
                     help="reproduce the source page geometry (photo grids etc.) "
                          "instead of reflowing the text")
+    ap.add_argument("--replace", action="append", default=[], metavar="OLD=>NEW",
+                    help="correct the source text, e.g. \"Valora Model UN=>OakBMUN\"; "
+                         "repeatable")
     ap.add_argument("--flow", action="store_true",
                     help="flow continuously instead of mirroring the source pagination")
     a = ap.parse_args()
@@ -586,11 +589,34 @@ if __name__ == "__main__":
         import pymupdf
         figs = figures(pymupdf.open(a.src), skip, a.figures)
         print(f"  {len(figs)} figure(s) carried over")
+    def apply_replacements(items):
+        pairs = [r.split("=>", 1) for r in a.replace if "=>" in r]
+        if not pairs:
+            return
+        for it in items:
+            runs = it.get("runs")
+            if not runs:
+                continue
+            for old, new in pairs:
+                joined = "".join(r[0] for r in runs)
+                if old not in joined:
+                    continue
+                if any(old in r[0] for r in runs):
+                    for r in runs:
+                        r[0] = r[0].replace(old, new)
+                else:
+                    # the phrase straddles runs, so flatten the paragraph
+                    bold = all(r[1] for r in runs)
+                    it["runs"] = [[joined.replace(old, new), bold]]
+                    runs = it["runs"]
+                it["text"] = "".join(r[0] for r in it["runs"])
+
     if a.start:
         for i, p in enumerate(paras):
             if p["text"].lower().startswith(a.start.lower()):
                 paras = paras[i:]
                 break
+    apply_replacements(paras)
     if figs:
         paras = sorted(paras + figs, key=lambda p: (p.get("page", 0), p.get("y", 0)))
     paged = any("page" in p for p in paras) and not a.flow
