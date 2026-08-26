@@ -33,7 +33,9 @@ TOP, BOTTOM = 74.0, 757.0
 PARA_GAP, HEAD_GAP_BEFORE, HEAD_GAP_AFTER = 10.0, 14.0, 8.0
 COVER_NAME_SIZE, COVER_NAME_BASELINE = 69.2, 590.5
 COVER_AGENDA_SIZE, COVER_AGENDA_BASELINE, COVER_AGENDA_LEAD = 18.3, 633.1, 25.3
-EMBLEM_BOX = (139.0, 244.0, 464.0, 570.0)   # where the reference cover puts it
+EMBLEM_BOX = (147.0, 238.0, 456.0, 530.0)  # reference box, pulled up off the
+                                           # committee name: the original art
+                                           # had padding, trimmed emblems don't
 NAVY = (0.055, 0.157, 0.278)
 
 

@@ -48,10 +48,8 @@ def from_pdf(path, skip):
                 text = "".join(s["text"] for s in spans).strip()
                 maxsize = max(round(s["size"], 1) for s in spans)
                 runs = [[s["text"], "Bold" in s["font"]] for s in spans]
-                all_bold = all(bl for _, bl in runs)
                 major = maxsize >= body_size + 1.4
-                kind = (True, 1) if major else \
-                       ((True, 2) if (all_bold and len(text) < 70) else (False, 1))
+                kind = (True, 1) if major else (False, 1)
                 lines.append({"text": text, "runs": runs, "kind": kind,
                               "x0": l["bbox"][0], "x1": l["bbox"][2], "page": pno})
     if not lines:
@@ -68,8 +66,14 @@ def from_pdf(path, skip):
         runs = merge(cur)
         text = "".join(r[0] for r in runs).strip()
         if text:
+            major = cur_kind[0]
+            all_bold = all(b for s, b in runs if s.strip())
+            # a whole short paragraph in bold is a subheading; bold inside a
+            # longer paragraph is just emphasis
+            sub = (not major and all_bold and len(text) < 70
+                   and text.rstrip().endswith((":", ".", "-", "?", "!")))
             paras.append({"text": text, "runs": runs,
-                          "heading": cur_kind[0], "level": cur_kind[1]})
+                          "heading": major or sub, "level": 1 if major else 2})
         cur.clear()
 
     span = right_edge - min(l["x0"] for l in lines)
