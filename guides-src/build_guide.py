@@ -175,11 +175,14 @@ class GuideWriter:
         head_lead = HEAD_SIZE * scale * (ratio * 0.92)
         sub_lead = SUB_SIZE * scale * (ratio * 0.96)
         for blk in blocks:
-            runs = blk["runs"]
+            runs = blk.get("runs", [])
             if isinstance(runs, str):
                 runs = [[runs, False]]
             runs = [(r[0], bool(r[1])) for r in runs]
             kind = blk.get("t", "p")
+            if kind == "tbl":
+                self.place_table(blk, fit, allow_break)
+                continue
             if kind == "i":
                 self.place_image(blk, scale * fig_scale, allow_break)
                 continue
@@ -205,6 +208,54 @@ class GuideWriter:
                 self.write_runs(runs, BODY_SIZE * scale, body_lead,
                                 allow_break=allow_break)
                 self.gap(PARA_GAP * g)
+
+    def place_table(self, blk, fit, allow_break=True):
+        """Draw a table detected in the source: teal header, ruled rows."""
+        scale, ratio = fit
+        size = BODY_SIZE * scale * 0.94
+        lead = size * max(ratio, 1.22)
+        anchors = blk["anchors"]
+        avail = RIGHT - LEFT
+        # column widths follow the source's own column positions
+        spans = [anchors[i + 1] - anchors[i] for i in range(len(anchors) - 1)]
+        spans.append(max(spans) if spans else 1)
+        total = sum(spans)
+        widths = [avail * s / total for s in spans]
+        pad = 6 * scale
+
+        for ri, row in enumerate(blk["rows"]):
+            header = ri == 0 and blk.get("header", False)
+            wrapped, height = [], 0
+            for ci, cell in enumerate(row):
+                runs = [(r[0], bool(r[1]) or header) for r in cell]
+                ls = self._wrap_runs(runs, size, max(widths[ci] - 2 * pad, 20))
+                wrapped.append(ls)
+                height = max(height, len(ls) * lead)
+            height += pad
+            if self.y + height > BOTTOM and allow_break:
+                self.new_page()
+            if not self.dry:
+                colour = TEAL if header else WHITE
+                x = LEFT
+                for ci, ls in enumerate(wrapped):
+                    yy = self.y + pad / 2
+                    for line in ls:
+                        sx = x + pad
+                        for wi, (word, bold) in enumerate(line):
+                            if wi:
+                                sx += self.measure(" ", "mont", size)
+                            self.page.insert_text((sx, yy + size), word,
+                                                  fontname="montb" if bold else "mont",
+                                                  fontfile=BOLD_TTF if bold else REG_TTF,
+                                                  fontsize=size, color=colour)
+                            sx += self.measure(word, "montb" if bold else "mont", size)
+                        yy += lead
+                    x += widths[ci]
+                rule = self.y + height - pad / 4
+                self.page.draw_line(pymupdf.Point(LEFT, rule), pymupdf.Point(RIGHT, rule),
+                                    color=(0.36, 0.55, 0.68), width=0.4)
+            self.y += height
+        self.gap(8 * scale)
 
     def place_image(self, blk, scale, allow_break=True):
         """Draw one of the source's figures, scaled to the frame."""
@@ -344,7 +395,8 @@ class GuideWriter:
             live = []
             for src in pages:
                 blocks = [b for b in src["blocks"]
-                          if b.get("t") == "i" or any(r[0].strip() for r in b["runs"])]
+                          if b.get("t") in ("i", "tbl")
+                          or any(r[0].strip() for r in b.get("runs", []))]
                 if blocks:
                     live.append(blocks)           # never emit a blank page
             usable = BOTTOM - TOP

@@ -35,6 +35,9 @@ def strip_marker(runs, n):
 def merge(runs):
     out = []
     for text, bold in runs:
+        if out and not text.strip():
+            out[-1][0] += text          # keep spacing with the run before it
+            continue
         if out and out[-1][1] == bold:
             out[-1][0] += text
         else:
@@ -91,6 +94,87 @@ def save_image(doc, xref, path):
     with open(path, "wb") as fh:
         fh.write(info["image"])
     return path
+
+
+def detect_tables(lines, min_rows=3, gap=18.0):
+    """Find borderless tables by geometry.
+
+    Guides set tables as plain text in columns, so there are no rules to find.
+    Each cell arrives as its own line sharing a baseline with its neighbours,
+    so rows are rebuilt by y and a table is several consecutive rows whose
+    cells start at the same x positions.
+
+    Returns {first_line_index: table} and the set of line indices consumed.
+    """
+    # group lines into visual rows by baseline
+    order, rows = [], []
+    for i, l in enumerate(lines):
+        if rows and l["page"] == lines[rows[-1][0]]["page"] \
+                and abs(l["y"] - lines[rows[-1][0]]["y"]) <= 3:
+            rows[-1].append(i)
+        else:
+            rows.append([i])
+    for r in rows:
+        r.sort(key=lambda i: lines[i]["x0"])
+
+    counts = collections.Counter()
+    for r in rows:
+        for i in r:
+            counts[round(lines[i]["x0"] / 4) * 4] += 1
+    anchors = sorted(x for x, n in counts.items() if n >= min_rows)
+
+    def anchor_of(x):
+        best = min(anchors, key=lambda a: abs(a - x), default=None)
+        return best if best is not None and abs(best - x) <= 6 else None
+
+    tables, used, ri = {}, set(), 0
+    while ri < len(rows):
+        cols = [anchor_of(lines[i]["x0"]) for i in rows[ri]]
+        cand = sorted({c for c in cols if c is not None})
+        wide = len(cand) >= 2 and min(b - a for a, b in zip(cand, cand[1:])) >= gap
+        if len(rows[ri]) < 2 or not wide:
+            ri += 1
+            continue
+        page = lines[rows[ri][0]]["page"]
+        gaps = [lines[rows[k + 1][0]]["y"] - lines[rows[k][0]]["y"]
+                for k in range(ri, min(ri + 6, len(rows) - 1))
+                if lines[rows[k + 1][0]]["page"] == page]
+        gaps = [g for g in gaps if g > 0]
+        typical = sorted(gaps)[len(gaps) // 2] if gaps else 20.0
+        out, rj = [], ri
+        while rj < len(rows) and lines[rows[rj][0]]["page"] == page:
+            if rj > ri:
+                step = lines[rows[rj][0]]["y"] - lines[rows[rj - 1][0]]["y"]
+                if step > typical * 2.5:
+                    break        # a gap this big means the table has ended
+            if any(lines[i]["kind"][0] for i in rows[rj]):
+                break            # a heading is not a table row
+            cj = [anchor_of(lines[i]["x0"]) for i in rows[rj]]
+            if all(c is None for c in cj):
+                break
+            starts = cj[0] == cand[0]
+            if cj[0] is not None and cj[0] < cand[0]:
+                break            # text to the left of the table: it has ended
+            if starts:
+                out.append({c: [] for c in cand})
+            elif not out:
+                break
+            for i, c in zip(rows[rj], cj):
+                out[-1].setdefault(c if c is not None else cand[-1], []).append(i)
+            rj += 1
+        if len(out) >= min_rows:
+            first = min(rows[ri])
+            # the header row often spans fewer columns than the body, so the
+            # column list is the union across every row
+            allc = sorted({c for row in out for c in row
+                           if any(r.get(c) for r in out)})
+            tables[first] = {"anchors": allc, "rows": out}
+            for r in rows[ri:rj]:
+                used.update(r)
+            ri = rj
+        else:
+            ri += 1
+    return tables, used
 
 
 def layout(doc, skip, outdir):
@@ -179,7 +263,15 @@ def from_pdf(path, skip):
                 runs = [[s["text"], "Bold" in s["font"]] for s in spans]
                 major = maxsize >= body_size + 1.4
                 kind = (True, 1) if major else (False, 1)
-                lines.append({"text": text, "runs": runs, "kind": kind,
+                segs = []
+                for s in spans:
+                    if segs and s["bbox"][0] - segs[-1]["x1"] < 8:
+                        segs[-1]["runs"].append([s["text"], "Bold" in s["font"]])
+                        segs[-1]["x1"] = s["bbox"][2]
+                    else:
+                        segs.append({"x0": s["bbox"][0], "x1": s["bbox"][2],
+                                     "runs": [[s["text"], "Bold" in s["font"]]]})
+                lines.append({"text": text, "runs": runs, "kind": kind, "segs": segs,
                               "x0": l["bbox"][0], "x1": l["bbox"][2],
                               "y": l["bbox"][1], "page": pno})
     if not lines:
@@ -240,7 +332,44 @@ def from_pdf(path, skip):
                           "page": cur_page[0], "y": cur_y[0]})
         cur.clear()
 
+    tables, table_lines = detect_tables(lines)
+
     for i, l in enumerate(lines):
+        if i in tables:
+            flush()
+            tb = tables[i]
+            rows = []
+            for row in tb["rows"]:
+                cells = []
+                for a in tb["anchors"]:
+                    cell, prev = [], None
+                    col_right = (tb["anchors"][tb["anchors"].index(a) + 1]
+                                 if a != tb["anchors"][-1] else page_right)
+                    for idx in row.get(a, []):
+                        ln = lines[idx]
+                        if cell:
+                            # if the next line's first word would have fitted on
+                            # the previous one, the break was mid-word
+                            head = ln["text"].split(" ")[0]
+                            room = col_right - prev["x1"]
+                            pw = prev["x1"] - prev["x0"]
+                            char_w = pw / max(len(prev["text"]), 1)
+                            midword = len(head) <= 4 and room > len(head) * char_w * 0.8
+                            if not midword:
+                                cell.append([" ", False])
+                        cell.extend(ln["runs"])
+                        prev = ln
+                    cells.append(merge(cell) if cell else [["", False]])
+                rows.append(cells)
+            head = all(len("".join(x[0] for x in cell).strip()) <= 30 for cell in rows[0]) \
+                if rows else False
+            paras.append({"t": "tbl", "anchors": tb["anchors"], "rows": rows,
+                          "header": head,
+                          "text": "", "runs": [["", False]], "heading": False,
+                          "level": 1, "page": l["page"], "y": l["y"]})
+            continue
+        if i in table_lines:
+            continue
         span = max(l["right"] - page_left, 1.0)
         right_edge = l["right"]
         if cur and (l["kind"] != cur_kind or cur_kind[0]):
@@ -340,6 +469,10 @@ def build_pages(paras, committee, agenda, emblem):
             cur_no = p.get("page")
             cur = {"page": cur_no, "blocks": []}
             pages.append(cur)
+        if p.get("t") == "tbl":
+            cur["blocks"].append({"t": "tbl", "anchors": p["anchors"], "rows": p["rows"],
+                                  "header": p.get("header", False)})
+            continue
         if p.get("t") == "i":
             cur["blocks"].append({k: p[k] for k in ("t", "src", "w", "h", "runs")})
             continue
@@ -359,7 +492,8 @@ def build_pages(paras, committee, agenda, emblem):
         else:
             cur["blocks"].append({"t": "p", "runs": runs})
     pages = [pg for pg in pages if any(
-        b.get("t") == "i" or any(r[0].strip() for r in b["runs"]) for b in pg["blocks"])]
+        b.get("t") in ("i", "tbl") or any(r[0].strip() for r in b["runs"])
+        for b in pg["blocks"])]
     out = {"committee": committee, "agenda": agenda, "pages": pages}
     if emblem:
         out["emblem"] = emblem
@@ -377,6 +511,10 @@ def build(paras, committee, agenda, emblem):
         return cur
 
     for p in paras:
+        if p.get("t") == "tbl":
+            ensure()["blocks"].append({"t": "tbl", "anchors": p["anchors"],
+                                       "rows": p["rows"], "header": p.get("header", False)})
+            continue
         if p.get("t") == "i":
             ensure()["blocks"].append({k: p[k] for k in ("t", "src", "w", "h", "runs")})
             continue
@@ -452,6 +590,9 @@ if __name__ == "__main__":
     json.dump(content, open(a.out, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
     if "pages" in content:
         blocks = [b for pg in content["pages"] for b in pg["blocks"]]
+        ntbl = sum(1 for b in blocks if b["t"] == "tbl")
+        if ntbl:
+            print(f"  {ntbl} table(s) detected")
         print(f"{a.out}: {len(content['pages'])} source pages, "
               f"{sum(1 for b in blocks if b['t'] == 'h')} headings, "
               f"{sum(1 for b in blocks if b['t'] == 'p')} paragraphs, "
